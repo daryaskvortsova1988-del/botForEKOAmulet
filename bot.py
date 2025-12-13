@@ -36,6 +36,8 @@ import hashlib
 from datetime import datetime
 from typing import Optional
 from functools import wraps
+from yookassa import Configuration, Payment
+import uuid
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, BotCommand, BotCommandScopeChat, BotCommandScopeDefault
 from telegram.ext import (
@@ -79,6 +81,7 @@ YOOKASSA_SHOP_ID = os.getenv('YOOKASSA_SHOP_ID')
 GOOGLE_SHEET_ID = os.getenv('GOOGLE_SHEET_ID')
 WEBHOOK_URL = os.getenv('WEBHOOK_URL', 'https://yourdomain.com')
 WEBHOOK_SECRET = os.getenv('WEBHOOK_SECRET', 'your_secret_key_change_this')
+BOT_RETURN_URL = os.getenv('BOT_RETURN_URL', 'https://t.me/svalery_telegram_task_bot')
 
 # Проверка обязательных параметров
 if not TELEGRAM_BOT_TOKEN:
@@ -87,6 +90,10 @@ if not ADMIN_CHAT_ID:
     raise ValueError("❌ ADMIN_CHAT_ID не установлен в .env!")
 if not YOOKASSA_API_KEY or not YOOKASSA_SHOP_ID:
     raise ValueError("❌ YOOKASSA_API_KEY или YOOKASSA_SHOP_ID не установлены в .env!")
+
+# Настройка ЮКассы
+Configuration.account_id = YOOKASSA_SHOP_ID
+Configuration.secret_key = YOOKASSA_API_KEY
 
 from logging.handlers import TimedRotatingFileHandler
 
@@ -106,6 +113,13 @@ log_handler = TimedRotatingFileHandler(
 )
 log_handler.suffix = "%d_%m_%y"  # Формат даты в имени файла при ротации
 
+class AccessLogFilter(logging.Filter):
+    """Фильтрует шумные ошибки aiohttp (например, HTTPS handshake на HTTP порт)"""
+    def filter(self, record):
+        if "BadStatusLine" in str(record.msg) or "Invalid method encountered" in str(record.msg):
+            return False
+        return True
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -114,6 +128,9 @@ logging.basicConfig(
         logging.StreamHandler()
     ]
 )
+
+# Применяем фильтр к aiohttp.server
+logging.getLogger("aiohttp.server").addFilter(AccessLogFilter())
 
 logger = logging.getLogger(__name__)
 
@@ -150,7 +167,30 @@ if SHEETS_AVAILABLE:
 STOCK_DATA = {'quantity': 10}
 ORDERS_DATA = {}
 WAITLIST_DATA = {}
-PENDING_PAYMENTS = {}  # ← Для отслеживания ожидающих платежей
+PENDING_PAYMENTS_FILE = "pending_payments.json"
+
+def load_pending_payments() -> dict:
+    """📂 Загрузка ожидающих платежей из файла"""
+    if os.path.exists(PENDING_PAYMENTS_FILE):
+        try:
+            with open(PENDING_PAYMENTS_FILE, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                logger.info(f"📂 Загружено {len(data)} ожидающих платежей")
+                return data
+        except Exception as e:
+            logger.error(f"❌ Ошибка загрузки pending_payments.json: {e}")
+            return {}
+    return {}
+
+def save_pending_payments():
+    """💾 Сохранение ожидающих платежей в файл"""
+    try:
+        with open(PENDING_PAYMENTS_FILE, 'w', encoding='utf-8') as f:
+            json.dump(PENDING_PAYMENTS, f, ensure_ascii=False, indent=4)
+    except Exception as e:
+        logger.error(f"❌ Ошибка сохранения pending_payments.json: {e}")
+
+PENDING_PAYMENTS = load_pending_payments()  # ← Загружаем при старте
 
 # ============================================================================
 # ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ - ВАЛИДАЦИЯ
@@ -256,6 +296,30 @@ async def _set_stock_no_lock(quantity: int) -> bool:
         STOCK_DATA['quantity'] = quantity
         return True
 
+def create_yookassa_payment(amount: int, description: str, metadata: dict) -> tuple[Optional[str], Optional[str]]:
+    """💳 Создание платежа в ЮKassa"""
+    try:
+        idempotence_key = str(uuid.uuid4())
+        payment = Payment.create({
+            "amount": {
+                "value": str(amount),
+                "currency": "RUB"
+            },
+            "confirmation": {
+                "type": "redirect",
+                "return_url": BOT_RETURN_URL
+            },
+            "capture": True,
+            "description": description,
+            "metadata": metadata
+        }, idempotence_key)
+        
+        logger.info(f"✅ Платеж создан в ЮKassa: {payment.id}")
+        return payment.id, payment.confirmation.confirmation_url
+    except Exception as e:
+        logger.error(f"❌ Ошибка создания платежа в ЮKassa: {e}")
+        return None, None
+
 async def get_stock() -> int:
     """✅ Получить текущий остаток (БЕЗОПАСНО для параллельного доступа)"""
     async with stock_lock:
@@ -359,7 +423,10 @@ async def process_successful_payment(payment_id: str) -> bool:
         await send_admin_notification(admin_notification)
         
         # Удаляем из PENDING
-        del PENDING_PAYMENTS[payment_id]
+        if payment_id in PENDING_PAYMENTS:
+            del PENDING_PAYMENTS[payment_id]
+            save_pending_payments()  # 💾 СОХРАНЯЕМ
+
         logger.info(f"✅ Заказ {payment_id} обработан успешно!")
         return True
     else:
@@ -606,25 +673,6 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     
     return ConversationHandler.END
 
-async def simulate_payment_callback(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """💳 Симуляция оплаты при нажатии кнопки"""
-    query = update.callback_query
-    user = query.from_user
-    await query.answer()
-    
-    # data format: pay_{payment_id}
-    payment_id = query.data.replace("pay_", "")
-    
-    logger.info(f"💳 Пользователь {user.id} симулирует оплату заказа {payment_id}")
-    
-    await query.edit_message_text("⏳ Обработка платежа (симуляция)...")
-    
-    success = await process_successful_payment(payment_id)
-    
-    if success:
-        await query.message.reply_text("✅ Симуляция успешна! Платеж обработан.")
-    else:
-        await query.message.reply_text("❌ Ошибка симуляции платежа.")
 
 async def button_buy_product(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """🛒 Нажатие кнопки 'КУПИТЬ'"""
@@ -802,10 +850,21 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
     phone = context.user_data.get('phone')
     
     try:
-        # 1️⃣ ГЕНЕРИРУЕМ УНИКАЛЬНЫЙ PAYMENT_ID
-        payment_id = f"PAY_{user.id}_{int(datetime.now().timestamp())}"
+        # 1️⃣ СОЗДАЕМ ПЛАТЕЖ В ЮКАССЕ
+        payment_id, confirmation_url = create_yookassa_payment(
+            amount=PRODUCT_PRICE,
+            description=f"Заказ {PRODUCT_NAME} для {phone}",
+            metadata={
+                "user_id": user.id,
+                "phone": phone
+            }
+        )
+
+        if not payment_id or not confirmation_url:
+             await query.edit_message_text("❌ Ошибка при создании платежа. Попробуйте позже.")
+             return ConversationHandler.END
         
-        # 2️⃣ СОХРАНЯЕМ В PENDING (перед попыткой уменьшить остаток)
+        # 3️⃣ СОХРАНЯЕМ В PENDING
         PENDING_PAYMENTS[payment_id] = {
             'user_id': user.id,
             'fio': fio,
@@ -814,7 +873,8 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             'status': 'pending',
             'created_at': datetime.now().isoformat()
         }
-        logger.info(f"📝 Заказ {payment_id} добавлен в PENDING_PAYMENTS")
+        logger.info(f"📝 Заказ {payment_id} создан в ЮКассе и добавлен в PENDING_PAYMENTS")
+        save_pending_payments()  # 💾 СОХРАНЯЕМ
         
         # 3️⃣ ПЫТАЕМСЯ УМЕНЬШИТЬ ОСТАТОК ОДНОВРЕМЕННО С ДОБАВЛЕНИЕМ В ТАБЛИЦУ
         # ⚠️ ВАЖНО: Сначала уменьшаем остаток, потом записываем
@@ -824,6 +884,7 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             # ❌ ОСТАТОК УМЕНЬШИТЬ НЕ ПОЛУЧИЛОСЬ
             logger.error(f"❌ Не удалось уменьшить остаток для заказа {payment_id}")
             del PENDING_PAYMENTS[payment_id]
+            save_pending_payments()  # 💾 СОХРАНЯЕМ
             
             await query.edit_message_text(
                 text="❌ К сожалению, товар закончился в момент оформления. Попробуйте позже."
@@ -856,17 +917,18 @@ async def confirm_order(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return ConversationHandler.END
         
         # ✅ ВСЕ УСПЕШНО! Показываем ссылку на оплату
+
+
         payment_text = (
-            f"💳 Оплата заказа №{payment_id}\n\n"
-            f"🔗 Ссылка для оплаты:\n"
-            f"(В реальном проекте здесь будет ссылка ЮКассы)\n\n"
-            f"💰 Сумма: {PRODUCT_PRICE} ₽"
+            f"💳 Оплата заказа\n\n"
+            f"� Сумма: {PRODUCT_PRICE} ₽\n"
+            f"🔗 Для оплаты нажмите кнопку ниже:"
         )
         
         keyboard = [[
             InlineKeyboardButton(
                 f"💳 ОПЛАТИТЬ {PRODUCT_PRICE} РУБ",
-                callback_data=f"pay_{payment_id}"
+                url=confirmation_url
             )
         ]]
         reply_markup = InlineKeyboardMarkup(keyboard)
@@ -1207,28 +1269,39 @@ async def cmd_notify_waitlist(update: Update, context: ContextTypes.DEFAULT_TYPE
 # ============================================================================
 
 async def handle_yookassa_webhook(request):
-    """✅ Обработчик webhook'а от ЮКассы (БЕЗОПАСНО!)"""
+    """✅ Обработчик webhook'а от ЮКассы"""
     try:
         # 1️⃣ ПОЛУЧАЕМ ДАННЫЕ
         body = await request.text()
         data = json.loads(body)
+        event = data.get('event')
         
         # 2️⃣ ПРОВЕРЯЕМ ПОДПИСЬ (БЕЗОПАСНОСТЬ!)
-        signature = request.headers.get('X-Signature', '')
-        if not validate_webhook_signature(signature, body):
-            logger.error("❌ Подпись webhook'а неверна!")
-            return web.Response(status=403, text="Forbidden")
+        # ⚠️ ЮКасса по умолчанию НЕ шлет X-Signature, если не настроен прокси.
+        # Самый надежный способ - проверить статус платежа через API.
         
         # 3️⃣ ОБРАБАТЫВАЕМ ПЛАТЕЖ
-        payment_id = data.get('id')
-        status = data.get('status')
-        metadata = data.get('metadata', {})
+        # ЮKassa присылает данные внутри поля "object"
+        payment_object = data.get('object', {})
+        payment_id = payment_object.get('id')
+        status = payment_object.get('status')
+        metadata = payment_object.get('metadata', {})
         
         logger.info(f"📬 Webhook от ЮКассы: платеж {payment_id}, статус {status}")
         
-        if status == 'succeeded':
+        if event == 'payment.succeeded' and status == 'succeeded':
             # ✅ ПЛАТЕЖ УСПЕШЕН!
-            logger.info(f"✅ Платеж {payment_id} успешен!")
+            # 🔒 ПРОВЕРКА ЧЕРЕЗ API (Double Check)
+            try:
+                payment = Payment.find_one(payment_id)
+                if payment.status != 'succeeded':
+                    logger.error(f"❌ Фейковый webhook? API говорит статус: {payment.status}")
+                    return web.Response(status=200, text="OK") # Отвечаем ОК, чтобы не спамили
+            except Exception as e:
+                logger.error(f"❌ Ошибка проверки статуса через API: {e}")
+                return web.Response(status=500, text="Internal Server Error")
+
+            logger.info(f"✅ Платеж {payment_id} подтвержден через API!")
             
             success = await process_successful_payment(payment_id)
             
@@ -1236,7 +1309,7 @@ async def handle_yookassa_webhook(request):
                 logger.error(f"❌ Не удалось обработать успешный платеж {payment_id}")
                 return web.Response(status=500, text="Internal Server Error")
         
-        elif status == 'canceled':
+        elif event == 'payment.canceled' or status == 'canceled':
             logger.warning(f"⚠️ Платеж {payment_id} отменен!")
             
             if payment_id in PENDING_PAYMENTS:
@@ -1269,9 +1342,7 @@ async def handle_yookassa_webhook(request):
                 )
                 
                 del PENDING_PAYMENTS[payment_id]
-        
-        elif status == 'pending':
-            logger.info(f"⏳ Платеж {payment_id} ожидает обработки")
+                save_pending_payments()  # 💾 СОХРАНЯЕМ
         
         return web.Response(status=200, text="OK")
     
@@ -1389,7 +1460,7 @@ def main():
             CommandHandler('start', start),
             CommandHandler('help', help_command),
             CallbackQueryHandler(button_buy_product, pattern='^buy_product$'),
-            CallbackQueryHandler(simulate_payment_callback, pattern='^pay_.*'),
+
         ],
         states={
             ASKING_PHONE: [
@@ -1438,8 +1509,41 @@ def main():
     # 4️⃣ Error handler
     application.add_error_handler(error_handler)
 
-    logger.info("📡 Запуск polling...")
-    application.run_polling()
+    # ✅ ЗАПУСК ВЕБ-СЕРВЕРА И БОТА
+    # Настраиваем веб-сервер для webhook'ов
+    app = web.Application()
+    app.router.add_post('/webhook', handle_yookassa_webhook)
+    
+    # Запускаем все вместе
+    async def run_app_and_bot():
+        # Настройка runner'а для aiohttp
+        runner = web.AppRunner(app)
+        await runner.setup()
+        site = web.TCPSite(runner, '0.0.0.0', 8080) # Порт 8080, можно вынести в .env
+        await site.start()
+        logger.info("🌍 Webhook server started on port 8080")
+        
+        # Запуск polling бота
+        logger.info("📡 Запуск polling...")
+        await application.initialize()
+        await application.updater.start_polling()
+        await application.start()
+        
+        # Бесконечный цикл, чтобы программа не завершилась
+        # В реальном проде лучше использовать signal handlers для graceful shutdown
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            logger.info("🛑 Stopping...")
+            await application.updater.stop()
+            await application.stop()
+            await runner.cleanup()
+
+    try:
+        event_loop.run_until_complete(run_app_and_bot())
+    except KeyboardInterrupt:
+        pass
 
 if __name__ == '__main__':
     main()
